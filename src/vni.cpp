@@ -1,11 +1,17 @@
 #include "vni.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
+#include <vector>
+
+#include <zlib.h>
 
 #include "FrameUtil.h"
+#include "vni_aes.h"
 #include "vni_heatshrink.h"
 #include "vni_internal.h"
 
@@ -847,16 +853,147 @@ static void maybe_reset_palette(Context* ctx) {
 
 using namespace vni;
 
+namespace {
+
+int hex_nibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+bool hex_to_key16(const char* hex, uint8_t out[16]) {
+  if (!hex) return false;
+  size_t n = std::strlen(hex);
+  if (n != 32) return false;
+  for (size_t i = 0; i < 16; ++i) {
+    int hi = hex_nibble(hex[2 * i]);
+    int lo = hex_nibble(hex[2 * i + 1]);
+    if (hi < 0 || lo < 0) return false;
+    out[i] = static_cast<uint8_t>((hi << 4) | lo);
+  }
+  return true;
+}
+
+bool gunzip_buffer(const uint8_t* in, size_t in_len,
+                   std::vector<uint8_t>* out) {
+  z_stream zs;
+  std::memset(&zs, 0, sizeof(zs));
+  if (inflateInit2(&zs, 15 + 32) != Z_OK) {
+    return false;
+  }
+  zs.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(in));
+  zs.avail_in = static_cast<uInt>(in_len);
+  std::vector<uint8_t> chunk(64 * 1024);
+  int ret;
+  do {
+    zs.next_out = chunk.data();
+    zs.avail_out = static_cast<uInt>(chunk.size());
+    ret = inflate(&zs, Z_NO_FLUSH);
+    if (ret != Z_OK && ret != Z_STREAM_END) {
+      inflateEnd(&zs);
+      return false;
+    }
+    out->insert(out->end(), chunk.data(),
+                chunk.data() + (chunk.size() - zs.avail_out));
+  } while (ret != Z_STREAM_END);
+  inflateEnd(&zs);
+  return true;
+}
+
+bool read_be_u16(std::istream& in, uint16_t* v) {
+  uint8_t b[2];
+  in.read(reinterpret_cast<char*>(b), 2);
+  if (in.gcount() != 2) return false;
+  *v = static_cast<uint16_t>((b[0] << 8) | b[1]);
+  return true;
+}
+
+bool read_be_u32(std::istream& in, uint32_t* v) {
+  uint8_t b[4];
+  in.read(reinterpret_cast<char*>(b), 4);
+  if (in.gcount() != 4) return false;
+  *v = (static_cast<uint32_t>(b[0]) << 24) |
+       (static_cast<uint32_t>(b[1]) << 16) |
+       (static_cast<uint32_t>(b[2]) << 8) | static_cast<uint32_t>(b[3]);
+  return true;
+}
+
+bool load_pac_into_context(const char* pac_path, const char* vni_key,
+                           Context* ctx) {
+  uint8_t key[16];
+  if (!hex_to_key16(vni_key, key)) {
+    std::fprintf(
+        stderr,
+        "VNI: invalid PAC key (must be 32 hex chars); refusing to load %s\n",
+        pac_path);
+    return false;
+  }
+  std::ifstream pac(pac_path, std::ios::binary);
+  if (!pac.is_open()) return false;
+  char magic[4] = {0, 0, 0, 0};
+  pac.read(magic, 4);
+  if (pac.gcount() != 4 || std::memcmp(magic, "PAC ", 4) != 0) {
+    std::fprintf(stderr, "VNI: %s is not a valid PAC file\n", pac_path);
+    return false;
+  }
+  pac.get();  // version byte
+  while (pac.peek() != std::char_traits<char>::eof()) {
+    uint16_t type;
+    uint32_t len;
+    if (!read_be_u16(pac, &type) || !read_be_u32(pac, &len)) {
+      std::fprintf(stderr, "VNI: malformed PAC chunk header in %s\n",
+                   pac_path);
+      return false;
+    }
+    if (len == 0 || (len % 16) != 0) {
+      std::fprintf(stderr, "VNI: bad PAC chunk size %u in %s\n",
+                   static_cast<unsigned>(len), pac_path);
+      return false;
+    }
+    std::vector<uint8_t> enc(len);
+    pac.read(reinterpret_cast<char*>(enc.data()), len);
+    if (static_cast<uint32_t>(pac.gcount()) != len) {
+      std::fprintf(stderr, "VNI: short read on PAC chunk in %s\n", pac_path);
+      return false;
+    }
+    auto plain = aes128_cbc_decrypt(enc.data(), enc.size(), key, key);
+    std::vector<uint8_t> raw;
+    if (!gunzip_buffer(plain.data(), plain.size(), &raw)) {
+      std::fprintf(stderr, "VNI: PAC chunk decompression failed in %s\n",
+                   pac_path);
+      return false;
+    }
+    std::string asStr(raw.begin(), raw.end());
+    std::istringstream iss(asStr, std::ios::binary);
+    if (type == 1) {
+      auto pal = std::make_unique<PalFile>();
+      if (!read_pal_file(iss, pal.get())) return false;
+      ctx->pal = std::move(pal);
+    } else if (type == 2) {
+      auto vni_obj = std::make_unique<VniFile>();
+      if (!read_vni_file(iss, vni_obj.get())) return false;
+      ctx->vni = std::move(vni_obj);
+    } else {
+      std::fprintf(stderr, "VNI: unknown PAC chunk type %u in %s\n",
+                   static_cast<unsigned>(type), pac_path);
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 Vni_Context* Vni_LoadFromPaths(const char* pal_path, const char* vni_path,
                                const char* pac_path, const char* vni_key) {
   auto ctx = std::make_unique<Context>();
 
   if (pac_path && pac_path[0] != '\0') {
-    std::fprintf(stderr,
-                 "VNI: encrypted PAC files are not supported; ignoring "
-                 "pac_path.\n");
+    if (!load_pac_into_context(pac_path, vni_key, ctx.get())) {
+      return nullptr;
+    }
   }
-  (void)vni_key;
 
   if (pal_path && pal_path[0] != '\0') {
     std::ifstream pal_file(pal_path, std::ios::binary);
