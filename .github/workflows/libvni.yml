@@ -51,7 +51,7 @@ jobs:
         include:
           - { os: windows-2025-vs2026, platform: win, arch: x64 }
           - { os: windows-2025-vs2026, platform: win, arch: x86 }
-          - { os: windows-2025, platform: win-mingw, arch: x64 }
+          - { os: windows-2025-vs2026, platform: win-mingw, arch: x64 }
           - { os: macos-15, platform: macos, arch: arm64 }
           - { os: macos-15, platform: macos, arch: x64 }
           - { os: ubuntu-24.04, platform: linux, arch: x64 }
@@ -66,7 +66,7 @@ jobs:
       # install dependencies
       #
       - if: (matrix.platform == 'win')
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
       - if: (matrix.platform == 'win-mingw')
         run: |
           /c/msys64/usr/bin/bash.exe -l -c "pacman -S --noconfirm \
@@ -78,6 +78,7 @@ jobs:
       - if: (matrix.platform == 'win')
         name: Build (win)
         run: |
+          ./platforms/${{ matrix.platform }}/${{ matrix.arch }}/external.sh
           if [[ "${{ matrix.arch }}" == "x64" ]]; then
             cmake \
               -G "Visual Studio 18 2026" \
@@ -102,6 +103,7 @@ jobs:
           CURRENT_DIR="$(pwd)"
           MSYSTEM=UCRT64 /c/msys64/usr/bin/bash.exe -l -c "
             cd \"${CURRENT_DIR}\" &&
+            ./platforms/${{ matrix.platform }}/${{ matrix.arch }}/external.sh &&
             cmake \
               -DCMAKE_BUILD_TYPE=Release \
               -DPLATFORM=${{ matrix.platform }} \
@@ -115,6 +117,7 @@ jobs:
       - if: (matrix.platform == 'macos')
         name: Build (macos)
         run: |
+          ./platforms/${{ matrix.platform }}/${{ matrix.arch }}/external.sh
           cmake \
             -DCMAKE_BUILD_TYPE=Release \
             -DPLATFORM=${{ matrix.platform }} \
@@ -127,6 +130,7 @@ jobs:
       - if: (matrix.platform == 'linux')
         name: Build (linux)
         run: |
+          ./platforms/${{ matrix.platform }}/${{ matrix.arch }}/external.sh
           cmake \
             -DCMAKE_BUILD_TYPE=Release \
             -DPLATFORM=${{ matrix.platform }} \
@@ -139,6 +143,7 @@ jobs:
       - if: (matrix.platform == 'ios' || matrix.platform == 'ios-simulator' || matrix.platform == 'tvos')
         name: Build (ios/tvos)
         run: |
+          ./platforms/${{ matrix.platform }}/${{ matrix.arch }}/external.sh
           cmake \
             -DCMAKE_BUILD_TYPE=Release \
             -DPLATFORM=${{ matrix.platform }} \
@@ -151,6 +156,7 @@ jobs:
       - if: (matrix.platform == 'android')
         name: Build (android)
         run: |
+          ./platforms/${{ matrix.platform }}/${{ matrix.arch }}/external.sh
           cmake \
             -DCMAKE_BUILD_TYPE=Release \
             -DPLATFORM=${{ matrix.platform }} \
@@ -265,7 +271,7 @@ jobs:
           path: release
           skip-decompress: true
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         if: startsWith(github.ref, 'refs/tags/')
         with:
           draft: true
